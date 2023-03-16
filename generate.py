@@ -10,11 +10,14 @@ import os
 import re
 import subprocess
 import sys
+import typing
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BAZEL = 'bazel'
 
 PROJECT_TYPE_GUID = '{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}'
+FOLDER_TYPE_GUID = '{2150E333-8FDC-42A3-9474-1A3956D46DE8}'
+
 
 class Label:
     PATTERN = re.compile(r'((@[a-zA-Z0-9/._-]+)?//)?([a-zA-Z0-9/._-]*)(:([a-zA-Z0-9_/.+=,@~-]+))?$')
@@ -29,6 +32,7 @@ class Label:
             raise NotImplementedError("Absolute package path required")
         self.package = match.group(3)
         self.name = match.group(5) or self.package.split('/')[-1]
+        self.unique_name = self.package.replace("/", "#") + "#" + self.name
 
     @property
     def absolute(self):
@@ -51,7 +55,7 @@ class Struct:
     pass
 
 class ProjectInfo:
-    def __init__(self, label, info_dict):
+    def __init__(self, label: Label, info_dict):
         self.label = label
         #self.ws_path = info_dict['workspace_root']
         self.rule = Struct()
@@ -89,10 +93,21 @@ class ProjectInfo:
 
     def _rewrite_include_path(self, cfg, rel_paths, path):
         path = path.replace('/', '\\').split('\\')  # MSYS2 confuses Python
+        if path[0] == "external":
+            path.insert(0, cfg.bazel_root)
         path = [node if node != cfg.default_cfg_dirname else '%(BazelCfgDirname)' for node in path]
         return os.path.normpath(os.path.join(rel_paths.workspace_root, *path))
 
-BuildConfig = namedtuple('BuildConfig', ['msbuild_name', 'bazel_name'])
+
+class FolderInfo(object):
+    def __init__(self, folder_path: str, parent_path: str):
+        self.folder_path = folder_path
+        self.folder_name = self.folder_path.rsplit("/", 1)[-1]
+        self.folder_guid = _generate_uuid_from_data("folder:"+self.folder_name)
+        self.folder_parent = parent_path
+
+
+BuildConfig = namedtuple('BuildConfig', ['msbuild_name', 'bazel_name', 'bazel_config'])
 PlatformConfig = namedtuple('PlatformConfig', ['msbuild_name', 'bazel_name'])
 
 class Configuration:
@@ -105,15 +120,20 @@ class Configuration:
         self.paths.bin = os.path.join(self.workspace_root, 'bazel-bin')
         self.paths.out = os.path.join(self.workspace_root, 'bazel-out')
 
+        self.bazel_root = "bazel-"+os.path.basename(os.getcwd()).lower()
+
         self._setup_env()
         self._build_target_list(args)
 
         self.solution_name = args.solution or os.path.basename(os.getcwd())
 
         self.build_configs = [
-            BuildConfig('Fastbuild', 'fastbuild'),
-            BuildConfig('Debug', 'dbg'),
-            BuildConfig('Release', 'opt'),
+            BuildConfig('Debug', 'dbg', ['-c', 'dbg']),
+            BuildConfig('RelWithDebInfo', 'opt', ['-c', 'opt', '--copt=/Z7']),
+            BuildConfig('Release', 'opt', ['-c', 'opt']),
+            BuildConfig('Debug[Remote]', 'dbg', ['-c', 'dbg', '--config=remote']),
+            BuildConfig('RelWithDebInfo[Remote]', 'opt', ['-c', 'opt', '--copt=/Z7', '--config=remote']),
+            BuildConfig('Release[Remote]', 'opt', ['-c', 'opt', '--config=remote']),
         ]
         self.platforms = [
             PlatformConfig('x64', 'x64_windows')
@@ -143,6 +163,15 @@ class Configuration:
         for query in queries:
             for target in self._get_targets_from_query(query, kinds):
                 targets[target] = True
+                deps = subprocess.check_output([
+                    BAZEL,
+                    'cquery',
+                    '--config=win',
+                    "filter('^//', kind(cc_library, deps(//engine/client)))"]).decode()
+                for each in deps.split("\n"):
+                    if each:
+                        t = each.split()[0]
+                        targets[t] = True
         self.targets = targets.keys()
 
     _LABEL_KIND_PATTERN = re.compile(r'(\w+) rule (.+)$')
@@ -232,18 +261,20 @@ def _msb_nmake_output(target, rel_paths):
     if not target.output_file:
         return ''
     return ((
-            r'<NMakeOutput>{rel_paths.out}\$(BazelCfgDirname)\bin\{target.label.package_path}' +
+            r'<NMakeOutput>{rel_paths.bin}\{target.label.package_path}' +
             r'\{target.output_file.basename}</NMakeOutput>'
         ).format(target=target, rel_paths=rel_paths)
     )
 
 def _msb_target_name_ext(target):
     if not target.output_file:
-        return ''
-    if '.' in target.output_file.basename:
-        name, ext = target.output_file.basename.rsplit('.', 1)
+        name = target.label.unique_name
+        ext = ""
     else:
-        name, ext = target.output_file.basename, ''
+        if '.' in target.output_file.basename:
+            name, ext = target.output_file.basename.rsplit('.', 1)
+        else:
+            name, ext = target.output_file.basename, ''
     return r'<TargetName>{}</TargetName><TargetExt>{}</TargetExt>'.format(name, ext)
 
 def _add_filter_to_set(filters, filter_name):
@@ -313,15 +344,29 @@ def _msb_files(cfg, info, filters=None):
         _msb_item_group(rel_ws_root, info, filters, info.rule.srcs, _msb_cc_src) +
         _msb_item_group(rel_ws_root, info, filters, info.rule.hdrs, _msb_cc_inc))
 
-def _sln_project(project):
+
+def _sln_project(project: ProjectInfo) -> str:
     # This first UUID appears to be an identifier for Visual C++ packages?
     return (
         'Project("{type_guid}") = "{name}", "{package}\\{name}.vcxproj", "{guid}"\nEndProject'
         .format(guid=project.guid, type_guid=PROJECT_TYPE_GUID,
-                name=project.label.name, package=project.label.package))
+                name=project.label.unique_name, package=project.label.package))
 
-def _sln_projects(projects):
-    return '\n'.join([_sln_project(project) for project in projects])
+
+def _sln_folder(folder_info: FolderInfo) -> str:
+    return (
+        'Project("{type_guid}") = "{name}", "{name}", "{guid}"\nEndProject'
+        .format(type_guid=FOLDER_TYPE_GUID,
+                name=folder_info.folder_name,
+                guid=folder_info.folder_guid))
+
+
+def _sln_projects(folders: typing.Dict[str, FolderInfo],
+                  projects: typing.List[ProjectInfo]) -> str:
+    result = [_sln_folder(folders[k]) for k in folders]
+    result.extend([_sln_project(project) for project in projects])
+    return '\n'.join(result)
+
 
 def _sln_cfgs(cfg):
     lines = []
@@ -348,6 +393,30 @@ def _sln_project_cfgs(cfg, projects):
                 ])
     return '\n\t\t'.join(lines)
 
+
+def _sln_project_to_parent(project_guid, parent_guid) -> str:
+    return f"{project_guid} = {parent_guid}"
+
+
+def _sln_nested_projects(folders: typing.Dict[str, FolderInfo],
+                         projects: typing.List[ProjectInfo]) -> str:
+    result = []
+    for k in folders:
+        each = folders[k]
+        if each.folder_parent:
+            line = _sln_project_to_parent(
+                each.folder_guid,
+                folders[each.folder_parent].folder_guid)
+            result.append(line)
+    for each in projects:
+        if each.label.package:
+            line = _sln_project_to_parent(
+                each.guid,
+                folders[each.label.package].folder_guid)
+            result.append(line)
+    return "\n\t\t".join(result)
+
+
 def _msb_project_cfgs(cfg):
     configs = []
     for build_config in cfg.build_configs:
@@ -361,17 +430,20 @@ def _msb_project_cfgs(cfg):
             )
     return ''.join(configs)
 
-def _msb_cfg_properties(cfg):
+def _msb_cfg_properties(cfg: Configuration):
     props = []
     user_config = ''.join(' --config=' + name for name in cfg.user_config_names)
     for build_config in cfg.build_configs:
         for platform in cfg.platforms:
+            builtin_config = list(build_config.bazel_config)
             props.append(r'''
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='{cfg.msbuild_name}|{platform.msbuild_name}'">
-    <BazelCfgOpts>-c {cfg.bazel_name}{user_config}</BazelCfgOpts>
+    <BazelCfgOpts>{builtin_config}{user_config}</BazelCfgOpts>
     <BazelCfgDirname>{platform.bazel_name}-{cfg.bazel_name}</BazelCfgDirname>
-  </PropertyGroup>'''
-                .format(cfg=build_config, platform=platform, user_config=user_config))
+  </PropertyGroup>'''.format(cfg=build_config,
+                             platform=platform,
+                             builtin_config=" ".join(builtin_config),
+                             user_config=user_config))
     return '\n'.join(props)
 
 def _msb_filter_items(filters):
@@ -438,21 +510,48 @@ def generate_projects(cfg):
         filters_content = _generate_project_filters(filters_template, cfg, info)
 
         _makedirs(project_dir)
-        with open(os.path.join(project_dir, info.label.name+'.vcxproj'), 'w') as out:
+        with open(os.path.join(project_dir, info.label.unique_name+'.vcxproj'), 'w') as out:
             out.write(content)
-        with open(os.path.join(project_dir, info.label.name+'.vcxproj.filters'), 'w') as out:
+        with open(os.path.join(project_dir, info.label.unique_name+'.vcxproj.filters'), 'w') as out:
             out.write(filters_content)
 
     return project_infos
 
-def generate_solution(cfg, project_infos):
+
+def _generate_folders(
+    project_infos: typing.List[ProjectInfo]
+) -> typing.Dict[str, FolderInfo]:
+    folder = OrderedDict()
+    for project in project_infos:
+        package = project.label.package
+        while package:
+            if package not in folder:
+                s = package.rsplit("/", 1)
+                if len(s) == 2:
+                    parent = s[0]
+                else:
+                    parent = None
+                folder[package] = FolderInfo(package, parent)
+                package = parent
+            else:
+                break
+    # Keep upper folder in the front.
+    reversed_result = OrderedDict()
+    for k in reversed(folder):
+        reversed_result[k] = folder[k]
+    return reversed_result
+
+
+def generate_solution(cfg, project_infos: typing.List[ProjectInfo]):
     with open(os.path.join(SCRIPT_DIR, 'templates', 'solution.sln')) as f:
         template = f.read()
     sln_filename = os.path.join(cfg.output_path, cfg.solution_name+'.sln')
+    folders = _generate_folders(project_infos)
     content = template.format(
-        projects=_sln_projects(project_infos),
+        projects=_sln_projects(folders, project_infos),
         cfgs=_sln_cfgs(cfg),
         project_cfgs=_sln_project_cfgs(cfg, project_infos),
+        nested_projects=_sln_nested_projects(folders, project_infos),
         guid=_generate_uuid_from_data(sln_filename))
     with open(sln_filename, 'w') as out:
         out.write(content)
